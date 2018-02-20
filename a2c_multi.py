@@ -5,20 +5,20 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 import torch
+import matplotlib.pyplot as plt
 import numpy as np
 import argparse
-import ppaquette_gym_super_mario
 import gym
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--env_name', default='BreakoutDeterministic-v4', type=str,
+parser.add_argument('--env_name', default='PongDeterministic-v4', type=str,
                     help='gym environment')
 parser.add_argument('--lr', default=3e-4, type=float,
                     help='learning rate')
 parser.add_argument('--gamma', default=0.99, type=float,
                     help='discount factor')
-parser.add_argument('--n_workers', default=4, type=int,
+parser.add_argument('--n_workers', default=32, type=int,
                     help='number of process')
 parser.add_argument('--n_step', default=20, type=int,
                     help='number of max step for update')
@@ -36,21 +36,25 @@ def pre_processing(obs):
 def worker(remote, parent_remote, env):
     parent_remote.close()
 
-    start_life = 5
+    #start_life = 5
     score = 0
     while True:
         cmd, data = remote.recv()
         if cmd == "step":
             ob, reward, done, info = env.step(data)
+            # env.render()
             score += reward
-            if start_life > info['ale.lives']:
-                reward = -1
-                start_life = info['ale.lives']
+
+            # if "Breakout" in args.env_name:
+            #     if start_life > info['ale.lives']:
+            #        reward = -1
+            #        start_life = info['ale.lives']
 
             if done:
                 print("Score: {}".format(score))
                 score = 0
-                ob = env.reset()
+                env.reset()
+                ob, *_ = env.step(1)
 
             ob = pre_processing(ob)
             remote.send((ob, reward, done, info))
@@ -153,6 +157,7 @@ class Agent:
         self.action_size = self.envs.action_space.n
         self.net = ATARInet(self.action_size)
         self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr)
+        self.avg_max_prob = []
         if torch.cuda.is_available() and args.cuda:
             self.net.cuda()
 
@@ -165,37 +170,49 @@ class Agent:
         probs = probs.data.cpu().numpy()
 
         acts = []
+        avg_max_probs = np.mean(np.max(probs, axis=-1))
+        self.avg_max_probs.append(avg_max_probs)
+
         for prob in probs:
             act = np.random.choice(self.action_size, 1, p=prob)
             acts.append(act)
         return np.array(acts)
 
     def train(self, obs, rews, dones, acts):
-        discounted_rews = self.discounted_rewards(rews, dones)
+        obs = np.float32(obs / 255.0).reshape(-1, 4, 84, 84)
+        obs = Variable(torch.from_numpy(obs))
+
+        if torch.cuda.is_available() and args.cuda:
+            obs = obs.cuda()
+        a, v = self.net(obs)
+
+        v = v.view(20, args.n_workers)
+        a = a.view(20, args.n_workers, -1)
+
+        discounted_rews = self.discounted_rewards(rews, dones, v[-1].data.cpu().numpy())
         discounted_rews -= np.mean(discounted_rews)
-        discounted_rews /= np.std(discounted_rews) + 1e-8
+        discounted_rews /= np.std(discounted_rews) + 1e-10
 
         discounted_rews = Variable(torch.from_numpy(discounted_rews))\
                                 .type(torch.FloatTensor)
         acts = torch.from_numpy(acts)\
                                 .type(torch.LongTensor)
 
-        obs = np.float32(obs / 255.0).reshape(-1, 4, 84, 84)
-        obs = Variable(torch.from_numpy(obs))
-        a, v = self.net(obs)
-
-        v = v.view(20, 4)
-        a = a.view(20, 4, -1)
 
         acts_onehot = torch.zeros(a.size()).type(torch.FloatTensor)
         acts_onehot = Variable(acts_onehot.scatter_(-1, acts, 1))
 
+        if torch.cuda.is_available() and args.cuda:
+            discounted_rews = discounted_rews.cuda()
+            acts_onehot = acts_onehot.cuda()
+        
         ## critic loss
         v_loss = (v - discounted_rews).pow(2).mean()
 
         ## actor loss
-        good_prob = ((a * acts_onehot).sum(-1) + 1e-10)
-        a_loss = -(good_prob.log() * (v.detach() - discounted_rews)).sum()
+        good_prob = ((a * acts_onehot).sum(-1) + 1e-10).log()
+        entropy = -(a * (a + 1e-10).log()).mean()
+        a_loss = -(good_prob * (discounted_rews - v.detach())).mean() + 0.01*entropy
 
         loss = 0.5*v_loss + a_loss
 
@@ -203,13 +220,13 @@ class Agent:
 
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm(self.net.parameters(), 40)
+        torch.nn.utils.clip_grad_norm(self.net.parameters(), 30)
         self.optimizer.step()
 
 
-    def discounted_rewards(self, rewses, doneses):
+    def discounted_rewards(self, rewses, doneses, v):
         discounted_rewses = np.zeros_like(rewses)
-        running_add = np.zeros_like(rewses[0])
+        running_add = v
 
         for t in reversed(range(0, len(rewses))):
             ##TODO: fix running add if game over
@@ -225,6 +242,8 @@ class Agent:
         obs = self.envs.reset()
         obses = obs
         state = np.stack([obses, obses, obses, obses], axis=1)
+        avg_max_prob_plt = []
+        global_step = 0
         while True:
             acts = self.get_actions(state)
             self.envs.step_async(acts)
@@ -246,13 +265,22 @@ class Agent:
             state = next_state
 
             t += 1
+            global_step += 1
             if t % args.n_step == 0:
                 self.train(states, rewses,
                            doneses, actses)
                 t = 0
 
+            if global_step % 1000 == 0:
+                avg_max_prob_plt.append(np.mean(self.avg_max_prob))
+                if global_step % 10000 == 0:
+                    plt.plot(avg_max_prob_plt)
+                    plt.savefig("./avg_max_prob_plt.jpg")
+
 
 if __name__ == "__main__":
+    display = Display(visable=0, size=(800, 600))
+    display.start()
     agent = Agent(env_name=args.env_name,
                   n_workers=args.n_workers)
     agent.run()
