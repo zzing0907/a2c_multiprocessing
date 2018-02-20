@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import argparse
 import gym
+import os
 
 
 parser = argparse.ArgumentParser()
@@ -18,12 +19,18 @@ parser.add_argument('--lr', default=3e-4, type=float,
                     help='learning rate')
 parser.add_argument('--gamma', default=0.99, type=float,
                     help='discount factor')
-parser.add_argument('--n_workers', default=32, type=int,
+parser.add_argument('--n_workers', default=16, type=int,
                     help='number of process')
 parser.add_argument('--n_step', default=20, type=int,
                     help='number of max step for update')
+parser.add_argument('--render', default=False, type=bool,
+                    help='render the environment')
 parser.add_argument('--cuda', default=True, type=bool,
                     help='use GPU or not')
+parser.add_argument('--save_dir', default='./models', type=str,
+                    help='directory of model save')
+parser.add_argument('--save_interval', default=5000, type=int,
+                    help='interval of saving model')
 args = parser.parse_args()
 
 
@@ -36,19 +43,14 @@ def pre_processing(obs):
 def worker(remote, parent_remote, env):
     parent_remote.close()
 
-    #start_life = 5
     score = 0
     while True:
         cmd, data = remote.recv()
         if cmd == "step":
             ob, reward, done, info = env.step(data)
-            # env.render()
+            if args.render:
+                env.render()
             score += reward
-
-            # if "Breakout" in args.env_name:
-            #     if start_life > info['ale.lives']:
-            #        reward = -1
-            #        start_life = info['ale.lives']
 
             if done:
                 print("Score: {}".format(score))
@@ -157,9 +159,15 @@ class Agent:
         self.action_size = self.envs.action_space.n
         self.net = ATARInet(self.action_size)
         self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr)
-        self.avg_max_prob = []
         if torch.cuda.is_available() and args.cuda:
             self.net.cuda()
+        if not os.path.exists(args.save_dir):
+            os.makedirs(args.save_dir)
+        else:
+            try:
+                self.net = torch.load(os.path.join(args.save_dir, args.env_name))
+            except:
+                print("No saved files")
 
     def get_actions(self, obses):
         obses = np.float32(obses / 255.0)
@@ -170,8 +178,6 @@ class Agent:
         probs = probs.data.cpu().numpy()
 
         acts = []
-        avg_max_probs = np.mean(np.max(probs, axis=-1))
-        self.avg_max_probs.append(avg_max_probs)
 
         for prob in probs:
             act = np.random.choice(self.action_size, 1, p=prob)
@@ -186,8 +192,8 @@ class Agent:
             obs = obs.cuda()
         a, v = self.net(obs)
 
-        v = v.view(20, args.n_workers)
-        a = a.view(20, args.n_workers, -1)
+        v = v.view(args.n_step, args.n_workers)
+        a = a.view(args.n_step, args.n_workers, -1)
 
         discounted_rews = self.discounted_rewards(rews, dones, v[-1].data.cpu().numpy())
         discounted_rews -= np.mean(discounted_rews)
@@ -197,7 +203,6 @@ class Agent:
                                 .type(torch.FloatTensor)
         acts = torch.from_numpy(acts)\
                                 .type(torch.LongTensor)
-
 
         acts_onehot = torch.zeros(a.size()).type(torch.FloatTensor)
         acts_onehot = Variable(acts_onehot.scatter_(-1, acts, 1))
@@ -223,13 +228,11 @@ class Agent:
         torch.nn.utils.clip_grad_norm(self.net.parameters(), 30)
         self.optimizer.step()
 
-
     def discounted_rewards(self, rewses, doneses, v):
         discounted_rewses = np.zeros_like(rewses)
         running_add = v
 
         for t in reversed(range(0, len(rewses))):
-            ##TODO: fix running add if game over
             for i in range(args.n_workers):
                 if doneses[t][i]:
                     running_add[i] = 0
@@ -242,7 +245,6 @@ class Agent:
         obs = self.envs.reset()
         obses = obs
         state = np.stack([obses, obses, obses, obses], axis=1)
-        avg_max_prob_plt = []
         global_step = 0
         while True:
             acts = self.get_actions(state)
@@ -271,16 +273,11 @@ class Agent:
                            doneses, actses)
                 t = 0
 
-            if global_step % 1000 == 0:
-                avg_max_prob_plt.append(np.mean(self.avg_max_prob))
-                if global_step % 10000 == 0:
-                    plt.plot(avg_max_prob_plt)
-                    plt.savefig("./avg_max_prob_plt.jpg")
+            if global_step % args.save_interval == 0:
+                torch.save(self.net, os.path.join(args.save_dir, args.env_name))
 
 
 if __name__ == "__main__":
-    display = Display(visable=0, size=(800, 600))
-    display.start()
     agent = Agent(env_name=args.env_name,
                   n_workers=args.n_workers)
     agent.run()
