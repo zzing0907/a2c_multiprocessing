@@ -177,11 +177,7 @@ class Agent:
         probs, value = self.net(obses)
         probs = probs.data.cpu().numpy()
 
-        acts = []
-
-        for prob in probs:
-            act = np.random.multinomial(1, p=prob).argmax()
-            acts.append(act)
+        acts = [[np.random.multinomial(1, prob).argmax()] for prob in probs]
         return np.array(acts)
 
     def train(self, obs, rews, dones, acts):
