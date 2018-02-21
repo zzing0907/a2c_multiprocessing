@@ -180,7 +180,7 @@ class Agent:
         acts = []
 
         for prob in probs:
-            act = np.random.choice(self.action_size, 1, p=prob)
+            act = np.random.multinomial(1, p=prob).argmax()
             acts.append(act)
         return np.array(acts)
 
