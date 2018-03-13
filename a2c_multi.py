@@ -19,7 +19,7 @@ parser.add_argument('--lr', default=3e-4, type=float,
                     help='learning rate')
 parser.add_argument('--gamma', default=0.99, type=float,
                     help='discount factor')
-parser.add_argument('--n_workers', default=16, type=int,
+parser.add_argument('--n_workers', default=24, type=int,
                     help='number of process')
 parser.add_argument('--n_step', default=20, type=int,
                     help='number of max step for update')
@@ -159,6 +159,7 @@ class Agent:
         self.action_size = self.envs.action_space.n
         self.net = ATARInet(self.action_size)
         self.optimizer = optim.Adam(self.net.parameters(), lr=args.lr)
+        self.avg_max_prob = []
         if torch.cuda.is_available() and args.cuda:
             self.net.cuda()
         if not os.path.exists(args.save_dir):
@@ -177,7 +178,10 @@ class Agent:
         probs, value = self.net(obses)
         probs = probs.data.cpu().numpy()
 
-        acts = [[np.random.multinomial(1, prob).argmax()] for prob in probs]
+        avg_max_probs = np.mean(np.max(probs, axis=-1))
+        self.avg_max_prob.append(avg_max_probs)
+
+        acts = [np.nonzero(np.random.multinomial(1, prob))[0] for prob in probs]
         return np.array(acts)
 
     def train(self, obs, rews, dones, acts):
@@ -229,9 +233,7 @@ class Agent:
         running_add = v
 
         for t in reversed(range(0, len(rewses))):
-            for i in range(args.n_workers):
-                if doneses[t][i]:
-                    running_add[i] = 0
+            running_add[doneses[t]] = 0
             running_add = running_add * args.gamma + rewses[t]
             discounted_rewses[t] = running_add
         return discounted_rewses
@@ -242,6 +244,7 @@ class Agent:
         obses = obs
         state = np.stack([obses, obses, obses, obses], axis=1)
         global_step = 0
+        avg_max_prob_plt = []
         while True:
             acts = self.get_actions(state)
             self.envs.step_async(acts)
@@ -269,8 +272,13 @@ class Agent:
                            doneses, actses)
                 t = 0
 
+            if global_step % 100 == 0:
+                avg_max_prob_plt.append(np.mean(self.avg_max_prob))
+
             if global_step % args.save_interval == 0:
                 torch.save(self.net, os.path.join(args.save_dir, args.env_name))
+                plt.plot(avg_max_prob_plt)
+                plt.savefig("./avg_max_prob_plt.jpg")
 
 
 if __name__ == "__main__":
